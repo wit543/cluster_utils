@@ -38,109 +38,135 @@ import time
 import sys
 import platform
 import pwd
+import chardet
 from threading import Timer
 
 import xml.etree.ElementTree as ET
 
 __version__ = '1.4.0'
 
-def getUser(cluster, pid):
-  if cluster == "":
-    # the /proc/PID is owned by process creator
-    proc_stat_file = os.stat("/proc/%d" % pid)
-    # get UID via stat call
-    uid = proc_stat_file.st_uid
-    # look up the username from uid
-    username = pwd.getpwuid(uid)[0]
-    return username
 
-  p = Popen(["ssh", cluster, "ps -o user= -p", str(pid)], stdout=PIPE)
-  stdout, stderr = p.communicate()
-  return stdout.decode("utf-8").strip()
+def decode_string(stdout):
+    try:
+        # Attempt to decode with UTF-8
+        output = stdout.decode('UTF-8')
+    except UnicodeDecodeError as e:
+        # print(f"UnicodeDecodeError: {e}")
+
+        # Try to detect the encoding
+        detected_encoding = chardet.detect(stdout)['encoding']
+        # print(f"Detected Encoding: {detected_encoding}")
+
+        # Decode with the detected encoding
+        output = stdout.decode(detected_encoding)
+
+        # Alternatively, you could use ignore or replace strategy
+        # output = stdout.decode('UTF-8', errors='ignore')
+        # output = stdout.decode('UTF-8', errors='replace')
+    return output
+
+
+def getUser(cluster, pid):
+    if cluster == "":
+        # the /proc/PID is owned by process creator
+        proc_stat_file = os.stat("/proc/%d" % pid)
+        # get UID via stat call
+        uid = proc_stat_file.st_uid
+        # look up the username from uid
+        username = pwd.getpwuid(uid)[0]
+        return username
+
+    p = Popen(["ssh", cluster, "ps -o user= -p", str(pid)], stdout=PIPE)
+    stdout, stderr = p.communicate()
+    return decode_string(stdout).strip()
 
 
 def getGPUsInfo(cluster="", getpid=False, timeout=9):
-  if cluster != "":
-    p = Popen(['ssh', cluster, "nvidia-smi", "-q", "-x"], stdout=PIPE)
-    timer = Timer(timeout, p.kill)
+    if cluster != "":
+        p = Popen(['ssh', cluster, "nvidia-smi", "-q", "-x"], stdout=PIPE)
+        timer = Timer(timeout, p.kill)
+        try:
+            timer.start()
+            stdout, stderr = p.communicate()
+        finally:
+            timer.cancel()
+    else:
+        p = Popen(["nvidia-smi", "-q", "-x"], stdout=PIPE)
+        stdout, stderr = p.communicate()
+
+    output = decode_string(stdout)
     try:
-      timer.start()
-      stdout, stderr = p.communicate()
-    finally:
-      timer.cancel()
-  else:
-    p = Popen(["nvidia-smi","-q", "-x"], stdout=PIPE)
-    stdout, stderr = p.communicate()
+        root = ET.fromstring(output)
+    except:
+        return []
 
-  output = stdout.decode('UTF-8')
-  try:
-    root = ET.fromstring(output)
-  except:
-    return []
+    info = []
+    for child in root:
+        # print(child.tag, end='')
+        if child.tag == "gpu":
+            gpu_util = int(child.find("utilization").find(
+                "gpu_util").text.replace(" %", ""))
 
-  info = []
-  for child in root:
-    # print(child.tag, end='')
-    if child.tag == "gpu":
-      gpu_util = int(child.find("utilization").find("gpu_util").text.replace(" %", ""))
+            mem_util = (100 * int(child.find("fb_memory_usage").find("used").text.replace(" MiB", ""))
+                        / int(child.find("fb_memory_usage").find("total").text.replace(" MiB", "")))
+            # print(mem_util, int(child.find("utilization").find("memory_util").text.replace(" %", "")))
 
-      mem_util = (100 * int(child.find("fb_memory_usage").find("used").text.replace(" MiB", ""))
-                  / int(child.find("fb_memory_usage").find("total").text.replace(" MiB", "")))
-      # print(mem_util, int(child.find("utilization").find("memory_util").text.replace(" %", "")))
+            if getpid:
+                procs = child.find("processes").findall("process_info")
+                proc_info = []
+                for proc in procs:
+                    pid = proc.find("pid").text
+                    proc_info.append((pid, getUser(cluster, int(pid))))
 
-      if getpid:
-        procs = child.find("processes").findall("process_info")
-        proc_info = []
-        for proc in procs:
-          pid = proc.find("pid").text
-          proc_info.append((pid, getUser(cluster, int(pid))))
+                info.append((gpu_util, mem_util, proc_info))
+            else:
+                info.append((gpu_util, mem_util))
 
-        info.append((gpu_util, mem_util, proc_info))
-      else:
-        info.append((gpu_util, mem_util))
+    print(cluster + "; ", end='')
+    sys.stdout.flush()
 
-  print(cluster + "; ", end='')
-  sys.stdout.flush()
+    return info
 
-
-  return info
 
 def printStatus(info, cpu_thresh=15, mem_thresh=15):
-  outstr = ""
-  for g in info:
-    if g[0] < cpu_thresh and g[1] < mem_thresh:
-      outstr += "\33[38;5;0m\33[48;5;82m%02d\33[0m " % g[1]
-    else:
-      outstr += "\33[38;5;0m\33[48;5;196m%02d\33[0m " % g[0]
+    outstr = ""
+    for g in info:
+        if g[0] < cpu_thresh and g[1] < mem_thresh:
+            outstr += "\33[38;5;0m\33[48;5;82m%02d\33[0m " % g[1]
+        else:
+            outstr += "\33[38;5;0m\33[48;5;196m%02d\33[0m " % g[0]
 
-  proclist = []
-  for g in info:
-    users = [proc[1] for proc in g[2]]
-    if len(users):
-      proclist.append(",".join(users))
-  outstr += " | ".join(proclist)
-  return outstr
+    proclist = []
+    for g in info:
+        users = [proc[1] for proc in g[2]]
+        if len(users):
+            proclist.append(",".join(users))
+    outstr += " | ".join(proclist)
+    return outstr
+
 
 def getAvailable(cluster, cpu_thresh=15, mem_thresh=15):
-  info = getGPUsInfo(cluster, getpid=False, timeout=3)
-  device = []
-  for i, g in enumerate(info):
-    if g[0] < cpu_thresh and g[1] < mem_thresh:
-      device.append(i)
-      # print("added ", cluster, i, g[0], g[1])
-  return device
+    info = getGPUsInfo(cluster, getpid=False, timeout=3)
+    device = []
+    for i, g in enumerate(info):
+        if g[0] < cpu_thresh and g[1] < mem_thresh:
+            device.append(i)
+            # print("added ", cluster, i, g[0], g[1])
+    return device
+
 
 def getFirstAvailable(cluster, cpu_thresh=15, mem_thres=15):
-  devices = getAvailable(cluster, cpu_thresh, mem_thres)
-  if len(devices) == 0:
-    raise RuntimeError("Cannot find available GPU")
-  print(devices)
-  return devices[0]
+    devices = getAvailable(cluster, cpu_thresh, mem_thres)
+    if len(devices) == 0:
+        raise RuntimeError("Cannot find available GPU")
+    print(devices)
+    return devices[0]
+
 
 def showUtilization(cluster):
-  info = getGPUsInfo(cluster, True)
-  outstr = "Cluster " + cluster
-  outstr += " " * (13 - len(outstr))
-  return outstr + printStatus(info) + "\n"
+    info = getGPUsInfo(cluster, True)
+    outstr = "Cluster " + cluster
+    outstr += " " * (13 - len(outstr))
+    return outstr + printStatus(info) + "\n"
 
 # print(getAvailable("v13"))
